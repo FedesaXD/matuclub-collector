@@ -1,0 +1,4 @@
+brawlstats
+psycopg2-binary
+httpx
+python-dotenv
