@@ -15,7 +15,10 @@ MATU3_TAG = '2VG0RQ299'
 MATU4_TAG = '2LLQ8VR2Q'
 
 def get_conn():
-    return psycopg2.connect(os.getenv("DATABASE_URL"))
+    url = os.getenv("DATABASE_URL")
+    if "sslmode" not in url:
+        url += "?sslmode=require"
+    return psycopg2.connect(url, sslmode="require")
 
 # ── AUTO API KEY ──────────────────────────────────────────────
 async def refresh_brawl_key():
