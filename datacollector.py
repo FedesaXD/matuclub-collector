@@ -153,22 +153,8 @@ async def add_data_to_database():
                 maxWs = 0
                 maxWsbrawler = ""
 
+                # 1. PRIMERO insertar el jugador (players es padre de player_brawlers)
                 for b in player.brawlers:
-                    # INSERT OR REPLACE en PostgreSQL
-                    cursor.execute("""
-                        INSERT INTO player_brawlers
-                            (player_tag, brawler_name, power_level, gadgets, star_powers, hipercharge, trophies)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (player_tag, brawler_name)
-                        DO UPDATE SET
-                            power_level = EXCLUDED.power_level,
-                            gadgets     = EXCLUDED.gadgets,
-                            star_powers = EXCLUDED.star_powers,
-                            hipercharge = EXCLUDED.hipercharge,
-                            trophies    = EXCLUDED.trophies
-                    """, (player.tag, b.name, b.power, len(b.gadgets),
-                          len(b.star_powers), len(b.hyper_charges), b.trophies))
-
                     if b.max_win_streak > maxWs:
                         maxWs = b.max_win_streak
                         maxWsbrawler = b.name
@@ -194,7 +180,23 @@ async def add_data_to_database():
                       player.totalPrestigeLevel, maxWs, maxWsbrawler,
                       player.club.tag))
 
-                # Solo guardar en historial si algo cambió
+                # 2. LUEGO insertar los brawlers (dependen de que el jugador exista)
+                for b in player.brawlers:
+                    cursor.execute("""
+                        INSERT INTO player_brawlers
+                            (player_tag, brawler_name, power_level, gadgets, star_powers, hipercharge, trophies)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (player_tag, brawler_name)
+                        DO UPDATE SET
+                            power_level = EXCLUDED.power_level,
+                            gadgets     = EXCLUDED.gadgets,
+                            star_powers = EXCLUDED.star_powers,
+                            hipercharge = EXCLUDED.hipercharge,
+                            trophies    = EXCLUDED.trophies
+                    """, (player.tag, b.name, b.power, len(b.gadgets),
+                          len(b.star_powers), len(b.hyper_charges), b.trophies))
+
+                # 3. Historial solo si algo cambió
                 cursor.execute("""
                     SELECT trophies, wins3v3, winsSolo
                     FROM player_stats_history
@@ -220,10 +222,13 @@ async def add_data_to_database():
                           player.totalPrestigeLevel, player.club.tag))
 
             except Exception as e:
-                print("ERROR PROCESANDO PLAYER:", e)
+                # En PostgreSQL hay que hacer rollback cuando falla una query
+                # para poder seguir usando la misma conexión
+                conn.rollback()
+                print(f"ERROR PROCESANDO PLAYER {player.tag}: {e}")
 
         conn.commit()
-        print("Datos guardados en Supabase correctamente")
+        print("Datos guardados correctamente")
 
     finally:
         cursor.close()
