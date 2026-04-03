@@ -15,9 +15,25 @@ MATU3_TAG = '2VG0RQ299'
 MATU4_TAG = '2LLQ8VR2Q'
 
 def get_conn():
+    import re
     url = os.getenv("DATABASE_URL", "")
-    url = url.replace("?sslmode=require", "").replace("&sslmode=require", "")
-    return psycopg2.connect(url, sslmode="require", connect_timeout=15)
+    # Parsear la URL manualmente para extraer los componentes
+    # formato: postgresql://user:password@host:port/dbname
+    match = re.match(r"postgresql://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+?)(\?.*)?$", url)
+    if not match:
+        raise ValueError(f"DATABASE_URL mal formateada: {url[:30]}...")
+    user, password, host, port, dbname = match.group(1,2,3,4,5)
+    # Quitar query params del dbname si los hay
+    dbname = dbname.split("?")[0]
+    return psycopg2.connect(
+        host=host,
+        port=int(port),
+        dbname=dbname,
+        user=user,
+        password=password,
+        sslmode="require",
+        connect_timeout=15
+    )
 
 # ── AUTO API KEY ──────────────────────────────────────────────
 async def refresh_brawl_key():
