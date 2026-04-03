@@ -15,15 +15,8 @@ MATU3_TAG = '2VG0RQ299'
 MATU4_TAG = '2LLQ8VR2Q'
 
 def get_conn():
-    import re
     url = os.getenv("DATABASE_URL", "")
-    # Si hay una IP IPv4 resuelta por el workflow, reemplazar el hostname
-    # para evitar que psycopg2 resuelva a IPv6
-    ipv4 = os.getenv("SUPABASE_IPV4", "")
-    if ipv4:
-        url = re.sub(r"@[^:/]+", f"@{ipv4}", url)
     url = url.replace("?sslmode=require", "").replace("&sslmode=require", "")
-    print(f"Conectando a Supabase ({ipv4 or 'hostname'})...")
     return psycopg2.connect(url, sslmode="require", connect_timeout=15)
 
 # ── AUTO API KEY ──────────────────────────────────────────────
