@@ -40,17 +40,24 @@ async def refresh_brawl_key():
 
     # Intentar con auth token primero, luego temporaryAPIToken
     keys = None
+    headers = None
     for tok in [token, temp_token]:
         if not tok:
             continue
-        headers = {**base_headers, "Authorization": f"Bearer {tok}"}
-        r = session.get("https://developer.brawlstars.com/api/apikey/list", headers=headers)
-        if r.status_code == 200:
-            try:
-                keys = r.json()["keys"]
-                break
-            except Exception:
-                pass
+        h = {**base_headers, "Authorization": f"Bearer {tok}"}
+        # Probar GET y POST (algunos endpoints aceptan solo uno)
+        for method in ["GET", "POST"]:
+            r = session.request(method, "https://developer.brawlstars.com/api/apikey/list", headers=h)
+            print(f"LIST {method} status={r.status_code} body={r.text[:300]}")
+            if r.status_code == 200:
+                try:
+                    keys = r.json()["keys"]
+                    headers = h
+                    break
+                except Exception as e:
+                    print(f"Parse error: {e}")
+        if keys is not None:
+            break
 
     if keys is None:
         print("No se pudo obtener lista de keys")
