@@ -1,5 +1,6 @@
 import asyncio
 import psycopg2
+import psycopg2.extras
 import brawlstats
 import httpx
 import os
@@ -9,10 +10,7 @@ from datetime import datetime, timedelta, timezone
 load_dotenv()
 UY_TZ = timezone(timedelta(hours=-3))
 
-MATU1_TAG = '282Y2LR8R'
-MATU2_TAG = '2Y9GY220C'
-MATU3_TAG = '2VG0RQ299'
-MATU4_TAG = '2LLQ8VR2Q'
+CLUB_TAGS = ['282Y2LR8R', '2Y9GY220C', '2VG0RQ299', '2LLQ8VR2Q']
 
 def get_conn():
     url = os.getenv("DATABASE_URL", "")
@@ -20,10 +18,10 @@ def get_conn():
 
 # ── AUTO API KEY ──────────────────────────────────────────────
 async def refresh_brawl_key():
-    ip = httpx.get("https://api.ipify.org").text.strip()
-    print("IP:", ip)
+    ip = httpx.get("https://api.ipify.org", timeout=10).text.strip()
+    print(f"IP: {ip}")
 
-    session = httpx.Client(follow_redirects=True)
+    session = httpx.Client(follow_redirects=True, timeout=15)
     base_headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
@@ -33,57 +31,48 @@ async def refresh_brawl_key():
 
     login = session.post(
         "https://developer.brawlstars.com/api/login",
-        json={
-            "email": os.getenv("BS_EMAIL"),
-            "password": os.getenv("BS_PASSWORD")
-        },
+        json={"email": os.getenv("BS_EMAIL"), "password": os.getenv("BS_PASSWORD")},
         headers=base_headers
     )
-
     data = login.json()
-    print("LOGIN RESPONSE:", data)
-
     token = data.get("auth", {}).get("token")
     temp_token = data.get("temporaryAPIToken")
 
-    headers = {**base_headers, "Authorization": f"Bearer {token}"}
+    # Intentar con auth token primero, luego temporaryAPIToken
+    keys = None
+    for tok in [token, temp_token]:
+        if not tok:
+            continue
+        headers = {**base_headers, "Authorization": f"Bearer {tok}"}
+        r = session.get("https://developer.brawlstars.com/api/apikey/list", headers=headers)
+        if r.status_code == 200:
+            try:
+                keys = r.json()["keys"]
+                break
+            except Exception:
+                pass
 
-    response = session.get(
-        "https://developer.brawlstars.com/api/apikey/list",
-        headers=headers
-    )
+    if keys is None:
+        print("No se pudo obtener lista de keys")
+        return None
 
-    print("LIST STATUS:", response.status_code)
-
-    try:
-        keys = response.json()["keys"]
-    except Exception:
-        print("Probando temporaryAPIToken...")
-        headers["Authorization"] = f"Bearer {temp_token}"
-        response = session.post(
-            "https://developer.brawlstars.com/api/apikey/list",
-            headers=headers
-        )
-        try:
-            keys = response.json()["keys"]
-        except Exception:
-            print("No se pudo obtener keys.")
-            return None
-
+    # Buscar key existente para esta IP
     for key in keys:
         if ip in key.get("cidrRanges", []):
-            print("Key existente encontrada")
+            print("Key existente reutilizada")
             return key["key"]
 
+    # Borrar la más vieja si llegamos al límite
     if len(keys) >= 10:
-        print("Borrando key vieja...")
+        oldest = sorted(keys, key=lambda k: k.get("validTime", 0))[0]
         session.post(
             "https://developer.brawlstars.com/api/apikey/revoke",
-            json={"id": keys[0]["id"]},
+            json={"id": oldest["id"]},
             headers=headers
         )
+        print(f"Key vieja borrada: {oldest['id']}")
 
-    print("Creando nueva key...")
+    # Crear nueva key
     create = session.post(
         "https://developer.brawlstars.com/api/apikey/create",
         json={
@@ -94,15 +83,12 @@ async def refresh_brawl_key():
         },
         headers=headers
     )
-
-    print("CREATE STATUS:", create.status_code)
-
     try:
         new_key = create.json()["key"]["key"]
         print("Nueva key creada")
         return new_key
     except Exception:
-        print("No se pudo crear la key")
+        print(f"No se pudo crear key: {create.text[:200]}")
         return None
 
 # ── DATA COLLECTION ───────────────────────────────────────────
@@ -117,55 +103,63 @@ async def add_data_to_database():
     cursor = conn.cursor()
 
     try:
-        matu1 = await client.get_club(MATU1_TAG)
-        matu2 = await client.get_club(MATU2_TAG)
-        matu3 = await client.get_club(MATU3_TAG)
-        matu4 = await client.get_club(MATU4_TAG)
+        # Fetchear los 4 clubs en paralelo
+        clubs = await asyncio.gather(
+            *[client.get_club(tag) for tag in CLUB_TAGS],
+            return_exceptions=True
+        )
 
         members_dict = {}
-        for m in (matu1.members + matu2.members + matu3.members + matu4.members):
-            members_dict[m.tag] = m
-        unique_tags = list(members_dict.keys())
+        for club in clubs:
+            if isinstance(club, Exception):
+                print(f"Error fetching club: {club}")
+                continue
+            for m in club.members:
+                members_dict[m.tag] = m
 
-        semaphore = asyncio.Semaphore(5)
+        unique_tags = list(members_dict.keys())
+        print(f"Jugadores únicos: {len(unique_tags)}")
+
+        # Fetchear jugadores con semáforo de 10 paralelos
+        semaphore = asyncio.Semaphore(10)
 
         async def fetch_player(tag):
             async with semaphore:
                 try:
-                    return await asyncio.wait_for(client.get_profile(tag), timeout=10)
+                    return await asyncio.wait_for(client.get_profile(tag), timeout=8)
                 except asyncio.TimeoutError:
-                    print(f"Timeout en {tag}")
+                    print(f"Timeout: {tag}")
                     return None
                 except Exception as e:
-                    print(f"Error en {tag}: {e}")
+                    print(f"Error {tag}: {e}")
                     return None
 
-        tasks = [fetch_player(tag) for tag in unique_tags]
-        players = await asyncio.gather(*tasks, return_exceptions=True)
-        print("Todos los fetch terminaron")
+        players = await asyncio.gather(
+            *[fetch_player(tag) for tag in unique_tags],
+            return_exceptions=True
+        )
+        print(f"Fetch terminado: {sum(1 for p in players if p is not None)} exitosos")
 
+        saved = 0
         for player in players:
             if player is None or isinstance(player, Exception):
-                print("ERROR: No se pudo fetchear un player")
                 continue
 
             try:
-                maxWs = 0
-                maxWsbrawler = ""
-
-                # 1. PRIMERO insertar el jugador (players es padre de player_brawlers)
+                # Calcular winstreak máximo
+                maxWs, maxWsbrawler = 0, ""
                 for b in player.brawlers:
                     if b.max_win_streak > maxWs:
                         maxWs = b.max_win_streak
                         maxWsbrawler = b.name
 
+                # 1. Insertar jugador primero (tabla padre)
                 cursor.execute("""
                     INSERT INTO players
                         (tag, name, highest_trophies, wins3v3, winsSolo,
                          total_prestige, highestWinstreak, maxWsBrawler, club_tag)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (tag)
-                    DO UPDATE SET
+                    ON CONFLICT (tag) DO UPDATE SET
                         name             = EXCLUDED.name,
                         highest_trophies = EXCLUDED.highest_trophies,
                         wins3v3          = EXCLUDED.wins3v3,
@@ -180,37 +174,34 @@ async def add_data_to_database():
                       player.totalPrestigeLevel, maxWs, maxWsbrawler,
                       player.club.tag))
 
-                # 2. LUEGO insertar los brawlers (dependen de que el jugador exista)
-                for b in player.brawlers:
-                    cursor.execute("""
-                        INSERT INTO player_brawlers
-                            (player_tag, brawler_name, power_level, gadgets, star_powers, hipercharge, trophies)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (player_tag, brawler_name)
-                        DO UPDATE SET
-                            power_level = EXCLUDED.power_level,
-                            gadgets     = EXCLUDED.gadgets,
-                            star_powers = EXCLUDED.star_powers,
-                            hipercharge = EXCLUDED.hipercharge,
-                            trophies    = EXCLUDED.trophies
-                    """, (player.tag, b.name, b.power, len(b.gadgets),
-                          len(b.star_powers), len(b.hyper_charges), b.trophies))
+                # 2. Insertar brawlers en batch (ejecuteMany es más rápido)
+                brawler_data = [
+                    (player.tag, b.name, b.power, len(b.gadgets),
+                     len(b.star_powers), len(b.hyper_charges), b.trophies)
+                    for b in player.brawlers
+                ]
+                psycopg2.extras.execute_values(cursor, """
+                    INSERT INTO player_brawlers
+                        (player_tag, brawler_name, power_level, gadgets, star_powers, hipercharge, trophies)
+                    VALUES %s
+                    ON CONFLICT (player_tag, brawler_name) DO UPDATE SET
+                        power_level = EXCLUDED.power_level,
+                        gadgets     = EXCLUDED.gadgets,
+                        star_powers = EXCLUDED.star_powers,
+                        hipercharge = EXCLUDED.hipercharge,
+                        trophies    = EXCLUDED.trophies
+                """, brawler_data)
 
                 # 3. Historial solo si algo cambió
                 cursor.execute("""
                     SELECT trophies, wins3v3, winsSolo
                     FROM player_stats_history
                     WHERE player_tag = %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
+                    ORDER BY timestamp DESC LIMIT 1
                 """, (player.tag,))
                 last = cursor.fetchone()
-
-                current = (
-                    player.trophies,
-                    player.team_victories,
-                    player.solo_victories + player.duo_victories
-                )
+                current = (player.trophies, player.team_victories,
+                           player.solo_victories + player.duo_victories)
 
                 if last is None or tuple(last) != current:
                     cursor.execute("""
@@ -221,14 +212,14 @@ async def add_data_to_database():
                           player.solo_victories + player.duo_victories,
                           player.totalPrestigeLevel, player.club.tag))
 
+                saved += 1
+
             except Exception as e:
-                # En PostgreSQL hay que hacer rollback cuando falla una query
-                # para poder seguir usando la misma conexión
                 conn.rollback()
-                print(f"ERROR PROCESANDO PLAYER {player.tag}: {e}")
+                print(f"ERROR {player.tag}: {e}")
 
         conn.commit()
-        print("Datos guardados correctamente")
+        print(f"✓ Datos guardados: {saved}/{len(unique_tags)} jugadores")
 
     finally:
         cursor.close()
