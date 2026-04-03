@@ -16,9 +16,9 @@ MATU4_TAG = '2LLQ8VR2Q'
 
 def get_conn():
     url = os.getenv("DATABASE_URL")
-    if "sslmode" not in url:
-        url += "?sslmode=require"
-    return psycopg2.connect(url, sslmode="require")
+    # Eliminar sslmode de la URL para pasarlo como parámetro separado
+    url = url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+    return psycopg2.connect(url, sslmode="require", connect_timeout=10)
 
 # ── AUTO API KEY ──────────────────────────────────────────────
 async def refresh_brawl_key():
