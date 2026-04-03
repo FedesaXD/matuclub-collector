@@ -14,10 +14,12 @@ jobs:
       - name: Checkout del código
         uses: actions/checkout@v4
 
-      - name: Deshabilitar IPv6 (forzar IPv4)
+      - name: Resolver IP IPv4 de Supabase
         run: |
-          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
-          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+          # Obtener solo la IP IPv4 del host de Supabase
+          IPV4=$(dig +short A db.ykpkiddviwjjrwikvhxe.supabase.co | head -1)
+          echo "Supabase IPv4: $IPV4"
+          echo "SUPABASE_IPV4=$IPV4" >> $GITHUB_ENV
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -31,6 +33,7 @@ jobs:
       - name: Correr el recolector
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_IPV4: ${{ env.SUPABASE_IPV4 }}
           BS_EMAIL:     ${{ secrets.BS_EMAIL }}
           BS_PASSWORD:  ${{ secrets.BS_PASSWORD }}
         run: python datacollector.py
