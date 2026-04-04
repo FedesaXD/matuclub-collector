@@ -150,11 +150,14 @@ async def add_data_to_database():
                         maxWsbrawler = b.name
 
                 # 1. Insertar jugador primero (tabla padre)
+                club_name = getattr(player.club, 'name', None)
+                icon_id   = getattr(player.icon, 'id', None)
+
                 cursor.execute("""
                     INSERT INTO players
                         (tag, name, highest_trophies, wins3v3, winsSolo,
-                         total_prestige, highestWinstreak, maxWsBrawler, club_tag)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (tag) DO UPDATE SET
                         name             = EXCLUDED.name,
                         highest_trophies = EXCLUDED.highest_trophies,
@@ -163,12 +166,14 @@ async def add_data_to_database():
                         total_prestige   = EXCLUDED.total_prestige,
                         highestWinstreak = EXCLUDED.highestWinstreak,
                         maxWsBrawler     = EXCLUDED.maxWsBrawler,
-                        club_tag         = EXCLUDED.club_tag
+                        club_tag         = EXCLUDED.club_tag,
+                        club_name        = EXCLUDED.club_name,
+                        icon_id          = EXCLUDED.icon_id
                 """, (player.tag, player.name, player.highest_trophies,
                       player.team_victories,
                       player.solo_victories + player.duo_victories,
                       player.totalPrestigeLevel, maxWs, maxWsbrawler,
-                      player.club.tag))
+                      player.club.tag, club_name, icon_id))
 
                 # 2. Insertar brawlers en batch (ejecuteMany es más rápido)
                 brawler_data = [
