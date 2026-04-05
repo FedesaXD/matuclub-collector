@@ -153,7 +153,7 @@ async def add_data_to_database():
                 club_name = getattr(player.club, 'name', None)
                 icon_id   = getattr(player.icon, 'id', None)
                 # Construir URL directamente — Brawlify usa el icon_id de la API oficial
-                icon_url  = f"https://cdn.brawlify.com/profile/{icon_id}.png" if icon_id else None
+                icon_url  = f"https://cdn.brawlify.com/profile-icons/regular/{icon_id}.png" if icon_id else None
 
                 cursor.execute("""
                     INSERT INTO players
