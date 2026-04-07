@@ -131,7 +131,7 @@ def handle_departures(cursor, current_club_tags: set):
     left_tags = db_tags - api_tags_with_hash
     if left_tags:
         psycopg2.extras.execute_values(cursor, """
-            INSERT INTO player_departures (player_tag, left_at)
+            INSERT INTO player_departures (player_tag)
             VALUES %s
             ON CONFLICT (player_tag) DO NOTHING
         """, [(tag,) for tag in left_tags])
