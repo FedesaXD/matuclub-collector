@@ -87,6 +87,82 @@ async def refresh_brawl_key():
         print(f"No se pudo crear key: {create.text[:200]}")
         return None
 
+# ── DEPARTURE TRACKING ────────────────────────────────────────
+
+def ensure_departures_table(cursor):
+    """Crea la tabla player_departures si no existe."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_departures (
+            player_tag TEXT PRIMARY KEY,
+            left_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+def handle_departures(cursor, current_club_tags: set):
+    """
+    Compara los jugadores en la DB con los que están actualmente en los clubs.
+    - Jugadores que salieron:  registrar su hora de salida (si no está ya registrada).
+    - Jugadores que volvieron: eliminar su registro de salida.
+    - Jugadores fuera por más de 24h: borrar TODOS sus datos en cascada.
+
+    current_club_tags: set de tags SIN '#' (como los devuelve la API de BS)
+    Devuelve la cantidad de jugadores eliminados.
+    """
+    ensure_departures_table(cursor)
+
+    # Tags de jugadores que ya teníamos en la DB (con '#')
+    cursor.execute("SELECT tag FROM players")
+    db_tags = {row[0] for row in cursor.fetchall()}
+
+    # Tags actuales en clubs convertidos a formato con '#'
+    api_tags_with_hash = {"#" + t for t in current_club_tags}
+
+    # ── Jugadores que VOLVIERON a un club (estaban en departures pero ahora aparecen)
+    if api_tags_with_hash:
+        cursor.execute("""
+            DELETE FROM player_departures
+            WHERE player_tag = ANY(%s)
+        """, (list(api_tags_with_hash),))
+        returned = cursor.rowcount
+        if returned:
+            print(f"↩  {returned} jugador(es) volvieron a un club — conteo de salida cancelado")
+
+    # ── Jugadores que SALIERON (están en DB pero no en ningún club actual)
+    left_tags = db_tags - api_tags_with_hash
+    if left_tags:
+        psycopg2.extras.execute_values(cursor, """
+            INSERT INTO player_departures (player_tag, left_at)
+            VALUES %s
+            ON CONFLICT (player_tag) DO NOTHING
+        """, [(tag,) for tag in left_tags])
+        new_departures = cursor.rowcount
+        if new_departures:
+            print(f"🚪 {new_departures} jugador(es) nuevos sin club — conteo de 24h iniciado")
+
+    # ── Eliminar jugadores que llevan más de 24h fuera
+    cursor.execute("""
+        SELECT player_tag FROM player_departures
+        WHERE left_at <= NOW() - INTERVAL '24 hours'
+    """)
+    expired_tags = [row[0] for row in cursor.fetchall()]
+
+    if expired_tags:
+        print(f"🗑  {len(expired_tags)} jugador(es) llevan +24h fuera — eliminando todos sus datos...")
+        for tag in expired_tags:
+            try:
+                # Borrar en orden correcto respetando foreign keys
+                cursor.execute("DELETE FROM event_snapshots WHERE player_tag = %s", (tag,))
+                cursor.execute("DELETE FROM player_stats_history WHERE player_tag = %s", (tag,))
+                cursor.execute("DELETE FROM player_brawlers WHERE player_tag = %s", (tag,))
+                cursor.execute("DELETE FROM players WHERE tag = %s", (tag,))
+                cursor.execute("DELETE FROM player_departures WHERE player_tag = %s", (tag,))
+                print(f"   ✓ Eliminado: {tag}")
+            except Exception as e:
+                print(f"   ERROR eliminando {tag}: {e}")
+                raise
+
+    return len(expired_tags)
+
 # ── DATA COLLECTION ───────────────────────────────────────────
 async def add_data_to_database():
     key = await refresh_brawl_key()
@@ -114,7 +190,13 @@ async def add_data_to_database():
                 members_dict[m.tag] = m
 
         unique_tags = list(members_dict.keys())
-        print(f"Jugadores únicos: {len(unique_tags)}")
+        print(f"Jugadores únicos en clubs: {len(unique_tags)}")
+
+        # ── Gestión de salidas / eliminaciones ANTES de guardar datos nuevos
+        deleted = handle_departures(cursor, set(unique_tags))
+        conn.commit()
+        if deleted:
+            print(f"✓ {deleted} jugador(es) eliminados por superar las 24h fuera del club")
 
         # Fetchear jugadores con semáforo de 10 paralelos
         semaphore = asyncio.Semaphore(10)
