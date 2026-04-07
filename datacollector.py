@@ -120,7 +120,6 @@ def handle_departures(cursor, current_club_tags: set):
     api_tags_with_hash = {normalize(t) for t in current_club_tags}
     print(f"Total DB: {len(db_tags)}")
     print(f"Total API: {len(api_tags_with_hash)}")
-    print(f"Left tags detectados: {len(left_tags)}")
 
     # ── Jugadores que VOLVIERON a un club (estaban en departures pero ahora aparecen)
     if api_tags_with_hash:
