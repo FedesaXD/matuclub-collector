@@ -110,12 +110,17 @@ def handle_departures(cursor, current_club_tags: set):
     """
     ensure_departures_table(cursor)
 
+    def normalize(tag: str):
+        return tag.strip().upper().replace("##", "#") if tag.startswith("#") else "#" + tag.strip().upper()
     # Tags de jugadores que ya teníamos en la DB (con '#')
     cursor.execute("SELECT tag FROM players")
-    db_tags = {row[0] for row in cursor.fetchall()}
+    db_tags = {normalize(row[0]) for row in cursor.fetchall()}
 
     # Tags actuales en clubs convertidos a formato con '#'
-    api_tags_with_hash = {"#" + t for t in current_club_tags}
+    api_tags_with_hash = {normalize(t) for t in current_club_tags}
+    print(f"Total DB: {len(db_tags)}")
+    print(f"Total API: {len(api_tags_with_hash)}")
+    print(f"Left tags detectados: {len(left_tags)}")
 
     # ── Jugadores que VOLVIERON a un club (estaban en departures pero ahora aparecen)
     if api_tags_with_hash:
