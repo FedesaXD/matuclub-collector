@@ -179,6 +179,14 @@ async def add_data_to_database():
     cursor = conn.cursor()
 
     try:
+        # Migración: asegurar columnas de ranked
+        cursor.execute("""
+            ALTER TABLE players
+                ADD COLUMN IF NOT EXISTS current_ranked_points INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS highest_ranked_points  INTEGER NOT NULL DEFAULT 0
+        """)
+        conn.commit()
+
         # Fetchear los 4 clubs en paralelo
         clubs = await asyncio.gather(
             *[client.get_club(tag) for tag in CLUB_TAGS],
@@ -241,9 +249,10 @@ async def add_data_to_database():
                 # Construir URL directamente — Brawlify usa el icon_id de la API oficial
                 icon_url  = f"https://cdn.brawlify.com/profile-icons/regular/{icon_id}.png" if icon_id else None
 
-                # Ranked points (pueden ser None si el jugador nunca jugó ranked)
-                current_ranked_pts = getattr(player, 'current_ranked_points', None) or 0
-                highest_ranked_pts = getattr(player, 'highest_ranked_points', None) or 0
+                # Ranked points — leídos del raw_data para evitar KeyError del Box
+                raw = player.raw_data if hasattr(player, 'raw_data') else {}
+                current_ranked_pts = raw.get('currentRankedPoints') or 0
+                highest_ranked_pts = raw.get('highestRankedPoints') or 0
 
                 cursor.execute("""
                     INSERT INTO players
