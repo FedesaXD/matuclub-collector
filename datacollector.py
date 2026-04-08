@@ -249,10 +249,15 @@ async def add_data_to_database():
                 # Construir URL directamente — Brawlify usa el icon_id de la API oficial
                 icon_url  = f"https://cdn.brawlify.com/profile-icons/regular/{icon_id}.png" if icon_id else None
 
-                # Ranked points — leídos del raw_data para evitar KeyError del Box
+                # Ranked points — leídos del raw_data
                 raw = player.raw_data if hasattr(player, 'raw_data') else {}
-                current_ranked_pts = raw.get('currentRankedPoints') or 0
-                highest_ranked_pts = raw.get('highestRankedPoints') or 0
+                # Log de diagnóstico para el primer jugador (detectar nombre real del campo)
+                if saved == 0:
+                    ranked_keys = {k: v for k, v in raw.items() if 'rank' in k.lower() or 'elo' in k.lower() or 'point' in k.lower() or 'tier' in k.lower()}
+                    print(f"[DIAG] Campos ranked en raw_data: {ranked_keys}")
+                    print(f"[DIAG] Todas las keys del jugador: {list(raw.keys())}")
+                current_ranked_pts = raw.get('currentRankedPoints') or raw.get('currentElo') or 0
+                highest_ranked_pts = raw.get('highestRankedPoints') or raw.get('highestElo') or 0
 
                 cursor.execute("""
                     INSERT INTO players
