@@ -179,14 +179,6 @@ async def add_data_to_database():
     cursor = conn.cursor()
 
     try:
-        # Migración: asegurar columnas de ranked
-        cursor.execute("""
-            ALTER TABLE players
-                ADD COLUMN IF NOT EXISTS current_ranked_points INTEGER NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS highest_ranked_points  INTEGER NOT NULL DEFAULT 0
-        """)
-        conn.commit()
-
         # Fetchear los 4 clubs en paralelo
         clubs = await asyncio.gather(
             *[client.get_club(tag) for tag in CLUB_TAGS],
@@ -249,42 +241,28 @@ async def add_data_to_database():
                 # Construir URL directamente — Brawlify usa el icon_id de la API oficial
                 icon_url  = f"https://cdn.brawlify.com/profile-icons/regular/{icon_id}.png" if icon_id else None
 
-                # Ranked points — leídos del raw_data
-                raw = player.raw_data if hasattr(player, 'raw_data') else {}
-                # Log de diagnóstico para el primer jugador (detectar nombre real del campo)
-                if saved == 0:
-                    ranked_keys = {k: v for k, v in raw.items() if 'rank' in k.lower() or 'elo' in k.lower() or 'point' in k.lower() or 'tier' in k.lower()}
-                    print(f"[DIAG] Campos ranked en raw_data: {ranked_keys}")
-                    print(f"[DIAG] Todas las keys del jugador: {list(raw.keys())}")
-                current_ranked_pts = raw.get('currentRankedPoints') or raw.get('currentElo') or 0
-                highest_ranked_pts = raw.get('highestRankedPoints') or raw.get('highestElo') or 0
-
                 cursor.execute("""
                     INSERT INTO players
                         (tag, name, highest_trophies, wins3v3, winsSolo,
-                         total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_id, icon_url,
-                         current_ranked_points, highest_ranked_points)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         total_prestige, highestWinstreak, maxWsBrawler, club_tag, club_name, icon_id, icon_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (tag) DO UPDATE SET
-                        name                  = EXCLUDED.name,
-                        highest_trophies      = EXCLUDED.highest_trophies,
-                        wins3v3               = EXCLUDED.wins3v3,
-                        winsSolo              = EXCLUDED.winsSolo,
-                        total_prestige        = EXCLUDED.total_prestige,
-                        highestWinstreak      = EXCLUDED.highestWinstreak,
-                        maxWsBrawler          = EXCLUDED.maxWsBrawler,
-                        club_tag              = EXCLUDED.club_tag,
-                        club_name             = EXCLUDED.club_name,
-                        icon_id               = EXCLUDED.icon_id,
-                        icon_url              = EXCLUDED.icon_url,
-                        current_ranked_points = EXCLUDED.current_ranked_points,
-                        highest_ranked_points = EXCLUDED.highest_ranked_points
+                        name             = EXCLUDED.name,
+                        highest_trophies = EXCLUDED.highest_trophies,
+                        wins3v3          = EXCLUDED.wins3v3,
+                        winsSolo         = EXCLUDED.winsSolo,
+                        total_prestige   = EXCLUDED.total_prestige,
+                        highestWinstreak = EXCLUDED.highestWinstreak,
+                        maxWsBrawler     = EXCLUDED.maxWsBrawler,
+                        club_tag         = EXCLUDED.club_tag,
+                        club_name        = EXCLUDED.club_name,
+                        icon_id          = EXCLUDED.icon_id,
+                        icon_url         = EXCLUDED.icon_url
                 """, (player.tag, player.name, player.highest_trophies,
                       player.team_victories,
                       player.solo_victories + player.duo_victories,
                       player.totalPrestigeLevel, maxWs, maxWsbrawler,
-                      player.club.tag, club_name, icon_id, icon_url,
-                      current_ranked_pts, highest_ranked_pts))
+                      player.club.tag, club_name, icon_id, icon_url))
 
                 # 2. Insertar brawlers en batch (ejecuteMany es más rápido)
                 brawler_data = [
