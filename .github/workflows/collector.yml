@@ -1,8 +1,6 @@
 name: Recolector de datos
 
 on:
-  schedule:
-    - cron: '0,20,40 * * * *'
   workflow_dispatch:
 
 jobs:
