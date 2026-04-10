@@ -352,7 +352,7 @@ def compute_and_update_player_of_day(cursor):
                 player_tag,
                 trophies,
                 wins3v3,
-                "winsSolo",
+                winssolo,
                 total_prestige,
                 timestamp,
                 ROW_NUMBER() OVER (
@@ -365,16 +365,16 @@ def compute_and_update_player_of_day(cursor):
             WHERE timestamp >= %s AND timestamp < %s
         ),
         day_first AS (
-            SELECT player_tag, trophies, wins3v3, "winsSolo", total_prestige
+            SELECT player_tag, trophies, wins3v3, winssolo, total_prestige
             FROM ranked WHERE rn_asc = 1
         ),
         day_last AS (
-            SELECT player_tag, trophies, wins3v3, "winsSolo", total_prestige
+            SELECT player_tag, trophies, wins3v3, winssolo, total_prestige
             FROM ranked WHERE rn_desc = 1
         ),
         prev_last AS (
             SELECT DISTINCT ON (player_tag)
-                player_tag, trophies, wins3v3, "winsSolo", total_prestige
+                player_tag, trophies, wins3v3, winssolo, total_prestige
             FROM player_stats_history
             WHERE timestamp < %s
             ORDER BY player_tag, timestamp DESC
@@ -383,7 +383,7 @@ def compute_and_update_player_of_day(cursor):
             dl.player_tag,
             COALESCE(dl.trophies,       pv.trophies)       - COALESCE(df.trophies,       pv.trophies,       0) AS dt,
             COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(df.wins3v3,        pv.wins3v3,        0) AS dw3,
-            COALESCE(dl."winsSolo",     pv."winsSolo")     - COALESCE(df."winsSolo",     pv."winsSolo",     0) AS dws,
+            COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(df.winssolo,       pv.winssolo,       0) AS dws,
             COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0) AS dp
         FROM day_last dl
         LEFT JOIN day_first df USING (player_tag)
