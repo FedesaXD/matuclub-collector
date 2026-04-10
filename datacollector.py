@@ -311,10 +311,155 @@ async def add_data_to_database():
         conn.commit()
         print(f"✓ Datos guardados: {saved}/{len(unique_tags)} jugadores")
 
+        # Actualizar jugador del día con los datos frescos
+        compute_and_update_player_of_day(cursor)
+        conn.commit()
+
     finally:
         cursor.close()
         conn.close()
         await client.close()
+
+
+# ── JUGADOR DEL DÍA ───────────────────────────────────────────
+def compute_and_update_player_of_day(cursor):
+    """
+    Calcula (o actualiza) el jugador del día para HOY en horario UY (UTC-3).
+    Se llama al final de cada run del collector.
+
+    Lógica:
+    - Día UY: 00:00 UY (03:00 UTC) → 00:00 UY del día siguiente
+    - Compara, para cada jugador, su snapshot MÁS ANTIGUO del día vs el MÁS RECIENTE.
+    - Si no tiene snapshot previo en el día, usa el último snapshot del día anterior como base.
+    - Gana quien acumuló más puntos (trofeos×1 + victorias×4 + prestige×80).
+    - Usa ON CONFLICT DO UPDATE para sobreescribir el resultado anterior del día.
+    - A partir de las 00:00 UY el día siguiente, este día ya no se toca más.
+    """
+    from datetime import date, timedelta
+
+    now_uy = datetime.now(timezone.utc) - timedelta(hours=3)
+    today  = now_uy.date()
+
+    day_start = datetime(today.year, today.month, today.day,
+                         3, 0, 0, tzinfo=timezone.utc)   # 00:00 UY = 03:00 UTC
+    day_end   = day_start + timedelta(hours=24)
+
+    print(f"Calculando jugador del día para {today} (UY)…")
+
+    cursor.execute("""
+        WITH ranked AS (
+            SELECT
+                player_tag,
+                trophies,
+                wins3v3,
+                "winsSolo",
+                total_prestige,
+                timestamp,
+                ROW_NUMBER() OVER (
+                    PARTITION BY player_tag ORDER BY timestamp ASC
+                ) AS rn_asc,
+                ROW_NUMBER() OVER (
+                    PARTITION BY player_tag ORDER BY timestamp DESC
+                ) AS rn_desc
+            FROM player_stats_history
+            WHERE timestamp >= %s AND timestamp < %s
+        ),
+        day_first AS (
+            SELECT player_tag, trophies, wins3v3, "winsSolo", total_prestige
+            FROM ranked WHERE rn_asc = 1
+        ),
+        day_last AS (
+            SELECT player_tag, trophies, wins3v3, "winsSolo", total_prestige
+            FROM ranked WHERE rn_desc = 1
+        ),
+        prev_last AS (
+            SELECT DISTINCT ON (player_tag)
+                player_tag, trophies, wins3v3, "winsSolo", total_prestige
+            FROM player_stats_history
+            WHERE timestamp < %s
+            ORDER BY player_tag, timestamp DESC
+        )
+        SELECT
+            dl.player_tag,
+            COALESCE(dl.trophies,       pv.trophies)       - COALESCE(df.trophies,       pv.trophies,       0) AS dt,
+            COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(df.wins3v3,        pv.wins3v3,        0) AS dw3,
+            COALESCE(dl."winsSolo",     pv."winsSolo")     - COALESCE(df."winsSolo",     pv."winsSolo",     0) AS dws,
+            COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0) AS dp
+        FROM day_last dl
+        LEFT JOIN day_first df USING (player_tag)
+        LEFT JOIN prev_last  pv USING (player_tag)
+    """, (day_start, day_end, day_start))
+
+    deltas = cursor.fetchall()
+    if not deltas:
+        print("  Sin snapshots del día todavía, saltando.")
+        return
+
+    best = None
+    best_points = -1
+    for (tag, dt, dw3, dws, dp) in deltas:
+        dt  = max(0, dt  or 0)
+        dw3 = max(0, dw3 or 0)
+        dws = max(0, dws or 0)
+        dp  = max(0, dp  or 0)
+        points = dt * 1 + (dw3 + dws) * 4 + dp * 80
+        if points > best_points:
+            best_points = points
+            best = (tag, dt, dw3, dws, dp, points)
+
+    if not best or best_points == 0:
+        print("  Nadie ha progresado todavía hoy.")
+        return
+
+    tag, dt, dw3, dws, dp, points = best
+
+    cursor.execute("""
+        SELECT name, icon_url, club_name FROM players WHERE tag = %s
+    """, (tag,))
+    row = cursor.fetchone()
+    if not row:
+        print(f"  Jugador {tag} no encontrado en players.")
+        return
+    name, icon_url, club_name = row
+
+    # Crear tabla si no existe (idempotente)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_of_day (
+            day         DATE PRIMARY KEY,
+            player_tag  TEXT NOT NULL,
+            player_name TEXT NOT NULL,
+            icon_url    TEXT,
+            club_name   TEXT,
+            points      INTEGER NOT NULL,
+            delta_trophies  INTEGER NOT NULL DEFAULT 0,
+            delta_wins3v3   INTEGER NOT NULL DEFAULT 0,
+            delta_winsSolo  INTEGER NOT NULL DEFAULT 0,
+            delta_prestige  INTEGER NOT NULL DEFAULT 0,
+            computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    # DO UPDATE: sobreescribe el resultado anterior del mismo día
+    cursor.execute("""
+        INSERT INTO player_of_day
+            (day, player_tag, player_name, icon_url, club_name,
+             points, delta_trophies, delta_wins3v3, delta_winsSolo, delta_prestige,
+             computed_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (day) DO UPDATE SET
+            player_tag     = EXCLUDED.player_tag,
+            player_name    = EXCLUDED.player_name,
+            icon_url       = EXCLUDED.icon_url,
+            club_name      = EXCLUDED.club_name,
+            points         = EXCLUDED.points,
+            delta_trophies = EXCLUDED.delta_trophies,
+            delta_wins3v3  = EXCLUDED.delta_wins3v3,
+            delta_winsSolo = EXCLUDED.delta_winsSolo,
+            delta_prestige = EXCLUDED.delta_prestige,
+            computed_at    = NOW()
+    """, (today, tag, name, icon_url, club_name, points, dt, dw3, dws, dp))
+
+    print(f"  ⭐ Jugador del día actualizado: {name} ({tag}) — {points} pts")
 
 
 if __name__ == "__main__":
