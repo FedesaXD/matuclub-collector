@@ -12,6 +12,14 @@ UY_TZ = timezone(timedelta(hours=-3))
 
 CLUB_TAGS = ['282Y2LR8R', '2Y9GY220C', '2VG0RQ299', '2LLQ8VR2Q']
 
+# La lógica del sorteo mensual (Sorteos / Brawl Pass Plus) vive en api_main.py,
+# expuesta como POST /raffle/draw — así hay una sola fuente de verdad para el
+# cálculo de tickets y la selección del ganador. Este script solo "toca el
+# timbre" en cada corrida; el endpoint decide si corresponde sortear (es
+# idempotente por mes, así que llamarlo de más no tiene efecto).
+RAFFLE_API_BASE = os.getenv("RAFFLE_API_BASE", "https://matuclub-api.onrender.com")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
 def get_conn():
     url = os.getenv("DATABASE_URL", "")
     return psycopg2.connect(url, connect_timeout=15)
@@ -315,10 +323,48 @@ async def add_data_to_database():
         compute_and_update_player_of_day(cursor)
         conn.commit()
 
+        # Disparar el sorteo mensual de Brawl Pass Plus si corresponde (no
+        # rompe la corrida si falla: es un "nice to have", no collection core).
+        await trigger_raffle_draw()
+
     finally:
         cursor.close()
         conn.close()
         await client.close()
+
+
+# ── SORTEOS (Brawl Pass Plus) ─────────────────────────────────
+async def trigger_raffle_draw():
+    """
+    Le pide a la API que sortee el mes anterior si todavía no lo hizo. Se
+    llama en cada corrida (cada 30 min); el endpoint es idempotente por mes,
+    así que en la inmensa mayoría de las corridas simplemente responde
+    'ya sorteado' y no pasa nada. El día 1 de cada mes, dentro de los
+    primeros 30 minutos, es cuando efectivamente ejecuta el sorteo.
+    """
+    if not ADMIN_KEY:
+        print("⚠ ADMIN_KEY no configurada: no se puede disparar el sorteo mensual.")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=20) as http:
+            r = await http.post(
+                f"{RAFFLE_API_BASE}/raffle/draw",
+                headers={"X-Admin-Key": ADMIN_KEY},
+            )
+        if r.status_code != 200:
+            print(f"⚠ /raffle/draw devolvió {r.status_code}: {r.text[:200]}")
+            return
+        data = r.json()
+        if data.get("skipped"):
+            print(f"🎟️  Sorteo: {data.get('reason', 'sin novedades')}")
+        else:
+            winner = data.get("winner")
+            if winner:
+                print(f"🎉 Sorteo del mes {data.get('cycle_month')}: ganó {winner['name']} ({winner['tag']}) con {winner['tickets_total']} tickets")
+            else:
+                print(f"🎟️  Sorteo del mes {data.get('cycle_month')} ejecutado sin participantes elegibles.")
+    except Exception as e:
+        print(f"⚠ No se pudo disparar el sorteo mensual: {e}")
 
 
 # ── JUGADOR DEL DÍA ───────────────────────────────────────────
