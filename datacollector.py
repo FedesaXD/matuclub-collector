@@ -323,6 +323,16 @@ async def add_data_to_database():
         compute_and_update_player_of_day(cursor)
         conn.commit()
 
+        # Guardar la foto del ranking oficial de clubes (Uruguay y Mundo)
+        # que usa la pestaña de Análisis. No rompe la corrida si falla.
+        try:
+            ensure_club_rankings_table(cursor)
+            await fetch_and_store_club_rankings(cursor, client)
+            conn.commit()
+        except Exception as e:
+            print(f"⚠ No se pudo actualizar el ranking de clubes: {e}")
+            conn.rollback()
+
         # Disparar el sorteo mensual de Brawl Pass Plus si corresponde (no
         # rompe la corrida si falla: es un "nice to have", no collection core).
         await trigger_raffle_draw()
@@ -331,6 +341,55 @@ async def add_data_to_database():
         cursor.close()
         conn.close()
         await client.close()
+
+
+# ── ANÁLISIS: RANKING OFICIAL DE CLUBES (Uruguay / Mundo) ──────────────────
+def ensure_club_rankings_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS club_rankings (
+            region       TEXT NOT NULL,
+            rank         INTEGER NOT NULL,
+            club_tag     TEXT NOT NULL,
+            club_name    TEXT NOT NULL,
+            trophies     INTEGER NOT NULL,
+            member_count INTEGER,
+            fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (region, club_tag)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_club_rankings_region_rank
+        ON club_rankings(region, rank)
+    """)
+
+
+async def fetch_and_store_club_rankings(cursor, client):
+    """
+    Guarda el top 200 oficial de clubes de Supercell para Uruguay y para el
+    Mundo. Se pisa por completo en cada corrida (DELETE + INSERT) porque a
+    la pestaña de Análisis solo le interesa la foto más reciente, no un
+    historial.
+    """
+    for region in ("UY", "global"):
+        try:
+            ranking = await client.get_rankings(ranking="clubs", region=region, limit=200)
+            rows = [
+                (region, c.rank, c.tag, c.name, c.trophies, getattr(c, "member_count", None))
+                for c in ranking
+            ]
+        except Exception as e:
+            print(f"⚠ No se pudo obtener el ranking de clubes de '{region}': {e}")
+            continue
+
+        if not rows:
+            continue
+
+        cursor.execute("DELETE FROM club_rankings WHERE region = %s", (region,))
+        psycopg2.extras.execute_values(cursor, """
+            INSERT INTO club_rankings (region, rank, club_tag, club_name, trophies, member_count)
+            VALUES %s
+        """, rows)
+        print(f"✓ Ranking de clubes '{region}' actualizado ({len(rows)} clubes)")
 
 
 # ── SORTEOS (Brawl Pass Plus) ─────────────────────────────────
