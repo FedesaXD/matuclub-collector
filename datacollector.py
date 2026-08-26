@@ -291,15 +291,22 @@ async def add_data_to_database():
                 """, brawler_data)
 
                 # 3. Historial solo si algo cambió
+                # IMPORTANTE: total_prestige tiene que estar en esta comparación.
+                # Si se omite (como antes), un jugador que sube de prestigio sin
+                # cambiar de trofeos/victorias en esa misma corrida no genera
+                # fila nueva -> ese avance se pierde para siempre del historial
+                # y jugador del día nunca lo puede contar (80 pts por prestigio,
+                # el valor más alto de la fórmula).
                 cursor.execute("""
-                    SELECT trophies, wins3v3, winsSolo
+                    SELECT trophies, wins3v3, winsSolo, total_prestige
                     FROM player_stats_history
                     WHERE player_tag = %s
                     ORDER BY timestamp DESC LIMIT 1
                 """, (player.tag,))
                 last = cursor.fetchone()
                 current = (player.trophies, player.team_victories,
-                           player.solo_victories + player.duo_victories)
+                           player.solo_victories + player.duo_victories,
+                           player.totalPrestigeLevel)
 
                 if last is None or tuple(last) != current:
                     cursor.execute("""
@@ -486,14 +493,28 @@ def compute_and_update_player_of_day(cursor):
         )
         SELECT
             dl.player_tag,
-            COALESCE(dl.trophies,       pv.trophies)       - COALESCE(df.trophies,       pv.trophies,       0) AS dt,
-            COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(df.wins3v3,        pv.wins3v3,        0) AS dw3,
-            COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(df.winssolo,       pv.winssolo,       0) AS dws,
-            COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(df.total_prestige, pv.total_prestige, 0) AS dp
+            -- BASE del día = último valor ANTES de las 00:00 UY (pv), no el
+            -- primer cambio registrado DENTRO del día (df). Como el historial
+            -- solo guarda una fila cuando el valor cambia respecto a la fila
+            -- anterior, "df" puede ser la única fila del día y coincidir
+            -- exactamente con "dl" (mismo cambio) -> eso daba delta 0 aunque
+            -- el jugador sí progresó. pv sí representa el valor real a las
+            -- 00:00 UY, se haya registrado una fila hoy o no.
+            COALESCE(dl.trophies,       pv.trophies)       - COALESCE(pv.trophies,       df.trophies,       0) AS dt,
+            COALESCE(dl.wins3v3,        pv.wins3v3)        - COALESCE(pv.wins3v3,        df.wins3v3,        0) AS dw3,
+            COALESCE(dl.winssolo,       pv.winssolo)       - COALESCE(pv.winssolo,       df.winssolo,       0) AS dws,
+            COALESCE(dl.total_prestige, pv.total_prestige) - COALESCE(pv.total_prestige, df.total_prestige, 0) AS dp
         FROM day_last dl
         LEFT JOIN day_first df USING (player_tag)
         LEFT JOIN prev_last  pv USING (player_tag)
+        ORDER BY dl.player_tag
     """, (day_start, day_end, day_start))
+    # ORDER BY determinístico: sin esto, Postgres puede devolver las filas en
+    # cualquier orden y, si dos jugadores empatan en puntos, el ganador
+    # elegido por el "if points > best_points" de abajo podía variar entre
+    # corridas (no reproducible). Con el orden fijo, el empate siempre lo
+    # gana la tag alfabéticamente menor — igual que en la query en vivo de
+    # api_main.py, que ahora usa el mismo criterio de desempate.
 
     deltas = cursor.fetchall()
     if not deltas:
