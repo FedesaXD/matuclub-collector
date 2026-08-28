@@ -106,26 +106,49 @@ def ensure_departures_table(cursor):
         )
     """)
 
-def handle_departures(cursor, current_club_tags: set):
+def normalize_tag(tag: str) -> str:
+    tag = (tag or "").strip().upper()
+    return tag.replace("##", "#") if tag.startswith("#") else "#" + tag
+
+
+def handle_departures(cursor, current_club_tags: set, fetched_club_tags: set):
     """
     Compara los jugadores en la DB con los que están actualmente en los clubs.
     - Jugadores que salieron:  registrar su hora de salida (si no está ya registrada).
     - Jugadores que volvieron: eliminar su registro de salida.
     - Jugadores fuera por más de 24h: borrar TODOS sus datos en cascada.
 
-    current_club_tags: set de tags SIN '#' (como los devuelve la API de BS)
+    current_club_tags: tags de JUGADORES (sin o con '#', se normaliza) que
+        aparecen ahora mismo en los clubes que se pudieron leer esta corrida.
+    fetched_club_tags: tags de CLUB (sin o con '#', se normaliza) que se
+        pudieron leer con éxito esta corrida.
+
+    IMPORTANTE sobre fetched_club_tags: si el fetch de un club falla esta
+    corrida (timeout, error de la API de Brawl Stars, etc.), sus miembros no
+    aparecen en current_club_tags — pero eso NO significa que se hayan ido,
+    solo que no pudimos leer los datos. Antes, esto se trataba igual que una
+    salida real: iniciaba la cuenta de 24h para el club ENTERO, y si la falla
+    se repetía sostenidamente, terminaba borrando en cascada todo el roster
+    y su historial por una falla transitoria de la API. Ahora solo se
+    considera "posible salida" a un jugador cuyo club SÍ se pudo leer con
+    éxito esta corrida — si no se pudo leer, se lo deja como estaba (ni se
+    inicia ni se cancela su conteo) hasta que haya una lectura confiable.
+
     Devuelve la cantidad de jugadores eliminados.
     """
     ensure_departures_table(cursor)
 
-    def normalize(tag: str):
-        return tag.strip().upper().replace("##", "#") if tag.startswith("#") else "#" + tag.strip().upper()
-    # Tags de jugadores que ya teníamos en la DB (con '#')
-    cursor.execute("SELECT tag FROM players")
-    db_tags = {normalize(row[0]) for row in cursor.fetchall()}
+    # Tags de jugadores que ya teníamos en la DB, junto con el club en el
+    # que estaban registrados la última vez (para poder filtrar por
+    # fetched_club_tags más abajo).
+    cursor.execute("SELECT tag, club_tag FROM players")
+    db_rows = cursor.fetchall()
+    db_club_of = {normalize_tag(tag): normalize_tag(club_tag) for tag, club_tag in db_rows}
+    db_tags = set(db_club_of.keys())
 
     # Tags actuales en clubs convertidos a formato con '#'
-    api_tags_with_hash = {normalize(t) for t in current_club_tags}
+    api_tags_with_hash = {normalize_tag(t) for t in current_club_tags}
+    fetched_clubs_norm = {normalize_tag(t) for t in fetched_club_tags}
     print(f"Total DB: {len(db_tags)}")
     print(f"Total API: {len(api_tags_with_hash)}")
 
@@ -139,8 +162,16 @@ def handle_departures(cursor, current_club_tags: set):
         if returned:
             print(f"↩  {returned} jugador(es) volvieron a un club — conteo de salida cancelado")
 
-    # ── Jugadores que SALIERON (están en DB pero no en ningún club actual)
-    left_tags = db_tags - api_tags_with_hash
+    # ── Jugadores que SALIERON (están en DB, no aparecen en los clubes leídos
+    #    esta corrida, Y su club SÍ se pudo leer con éxito esta corrida — ver
+    #    docstring). Los que quedan afuera del filtro no se tocan.
+    candidates = db_tags - api_tags_with_hash
+    left_tags = {tag for tag in candidates if db_club_of.get(tag) in fetched_clubs_norm}
+    skipped = len(candidates) - len(left_tags)
+    if skipped:
+        print(f"⏸  {skipped} jugador(es) no aparecen en los clubes leídos, pero su club "
+              f"falló esta corrida — no se los marca como salida todavía")
+
     if left_tags:
         psycopg2.extras.execute_values(cursor, """
             INSERT INTO player_departures (player_tag)
@@ -194,18 +225,25 @@ async def add_data_to_database():
         )
 
         members_dict = {}
-        for club in clubs:
+        fetched_club_tags = set()  # clubes que SÍ se pudieron leer esta corrida
+        for club_tag, club in zip(CLUB_TAGS, clubs):
             if isinstance(club, Exception):
                 print(f"Error fetching club: {club}")
                 continue
+            fetched_club_tags.add(normalize_tag(club_tag))
             for m in club.members:
                 members_dict[m.tag] = m
 
         unique_tags = list(members_dict.keys())
         print(f"Jugadores únicos en clubs: {len(unique_tags)}")
 
+        failed_clubs = len(CLUB_TAGS) - len(fetched_club_tags)
+        if failed_clubs:
+            print(f"⚠ {failed_clubs} club(es) no se pudieron leer esta corrida — "
+                  f"sus miembros quedan exentos del conteo de salida por esta vez")
+
         # ── Gestión de salidas / eliminaciones ANTES de guardar datos nuevos
-        deleted = handle_departures(cursor, set(unique_tags))
+        deleted = handle_departures(cursor, set(unique_tags), fetched_club_tags)
         conn.commit()
         if deleted:
             print(f"✓ {deleted} jugador(es) eliminados por superar las 24h fuera del club")
@@ -317,18 +355,38 @@ async def add_data_to_database():
                           player.solo_victories + player.duo_victories,
                           player.totalPrestigeLevel, player.club.tag))
 
+                # Confirmamos ACÁ, jugador por jugador, en vez de un solo
+                # commit() al final del for. Antes, todos los INSERT/UPDATE
+                # de esta corrida compartían una única transacción sin
+                # confirmar: si un jugador a mitad de la lista tiraba una
+                # excepción, el rollback() de abajo descartaba TAMBIÉN el
+                # trabajo ya hecho para todos los jugadores procesados ANTES
+                # en esa misma corrida — aunque el contador "saved" ya los
+                # hubiera contado como guardados exitosamente. Confirmando
+                # por jugador, una falla puntual solo pierde a ese jugador.
+                conn.commit()
                 saved += 1
 
             except Exception as e:
                 conn.rollback()
                 print(f"ERROR {player.tag}: {e}")
 
-        conn.commit()
         print(f"✓ Datos guardados: {saved}/{len(unique_tags)} jugadores")
 
         # Actualizar jugador del día con los datos frescos
         compute_and_update_player_of_day(cursor)
         conn.commit()
+
+        # Resolver predicciones de días anteriores (no rompe la corrida si
+        # falla — el fallback en la API la vuelve a intentar en la próxima
+        # visita al sitio).
+        try:
+            now_uy = datetime.now(timezone.utc) - timedelta(hours=3)
+            resolve_predictions(cursor, now_uy.date())
+            conn.commit()
+        except Exception as e:
+            print(f"⚠ No se pudieron resolver predicciones: {e}")
+            conn.rollback()
 
         # Guardar la foto del ranking oficial de clubes (Uruguay y Mundo)
         # que usa la pestaña de Análisis. No rompe la corrida si falla.
@@ -586,6 +644,63 @@ def compute_and_update_player_of_day(cursor):
     """, (today, tag, name, icon_url, club_name, points, dt, dw3, dws, dp))
 
     print(f"  ⭐ Jugador del día actualizado: {name} ({tag}) — {points} pts")
+
+
+def resolve_predictions(cursor, today):
+    """
+    Resuelve toda predicción cuyo target_day ya haya terminado (< today) y
+    todavía no esté resuelta: compara predicted_tag contra el ganador real
+    en player_of_day para ese día. Si ese día no tiene fila en player_of_day
+    (nadie tuvo actividad — caso raro pero posible), se resuelve igual como
+    incorrecta, con winner_tag NULL, para que la predicción no quede
+    pendiente para siempre.
+
+    Duplica la lógica de la función homónima en api_main.py (misma idea que
+    ya existe para jugador del día: el collector la corre cada 30 min, y la
+    API la vuelve a correr como red de seguridad antes de responder).
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_predictions (
+            id             SERIAL PRIMARY KEY,
+            predictor_tag  TEXT NOT NULL,
+            target_day     DATE NOT NULL,
+            predicted_tag  TEXT NOT NULL,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            resolved_at    TIMESTAMPTZ,
+            correct        BOOLEAN,
+            winner_tag     TEXT,
+            ticket_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+            UNIQUE (predictor_tag, target_day)
+        )
+    """)
+
+    cursor.execute("""
+        UPDATE player_predictions pp
+        SET resolved_at = NOW(),
+            winner_tag  = pod.player_tag,
+            correct     = (pp.predicted_tag = pod.player_tag)
+        FROM player_of_day pod
+        WHERE pp.target_day = pod.day
+          AND pp.resolved_at IS NULL
+          AND pp.target_day < %s
+    """, (today,))
+    resolved_matched = cursor.rowcount
+
+    cursor.execute("""
+        UPDATE player_predictions pp
+        SET resolved_at = NOW(),
+            winner_tag  = NULL,
+            correct     = FALSE
+        WHERE pp.resolved_at IS NULL
+          AND pp.target_day < %s
+          AND NOT EXISTS (SELECT 1 FROM player_of_day pod WHERE pod.day = pp.target_day)
+    """, (today,))
+    resolved_empty = cursor.rowcount
+
+    total = resolved_matched + resolved_empty
+    if total:
+        print(f"  🔮 {total} predicción(es) resuelta(s) para días anteriores")
 
 
 if __name__ == "__main__":
