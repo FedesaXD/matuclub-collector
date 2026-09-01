@@ -23,6 +23,7 @@ jobs:
 
       - name: Correr el recolector
         env:
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           BS_EMAIL:     ${{ secrets.BS_EMAIL }}
           BS_PASSWORD:  ${{ secrets.BS_PASSWORD }}
