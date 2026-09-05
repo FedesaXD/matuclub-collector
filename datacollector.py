@@ -268,6 +268,28 @@ async def add_data_to_database():
         )
         print(f"Fetch terminado: {sum(1 for p in players if p is not None)} exitosos")
 
+        # Últimos snapshots conocidos, en batch (evita 1 SELECT por jugador
+        # adentro del for de abajo — antes eran hasta ~len(unique_tags)
+        # round-trips solo para esto, uno por jugador, en cada corrida).
+        # Es 100% equivalente a la consulta que hacía cada iteración: el
+        # resultado para un player_tag no depende de los históricos que se
+        # inserten en ESTA misma corrida para OTROS jugadores (cada fila de
+        # player_stats_history es independiente por player_tag, y ningún
+        # tag se repite dentro de unique_tags), así que traer todo de una
+        # sola vez ACÁ, antes de que el loop escriba nada, da exactamente
+        # el mismo "último valor conocido" que cada SELECT individual
+        # hubiera dado en su turno.
+        last_history_by_tag = {}
+        if unique_tags:
+            cursor.execute("""
+                SELECT DISTINCT ON (player_tag)
+                    player_tag, trophies, wins3v3, winsSolo, total_prestige
+                FROM player_stats_history
+                WHERE player_tag = ANY(%s)
+                ORDER BY player_tag, timestamp DESC
+            """, (unique_tags,))
+            last_history_by_tag = {row[0]: tuple(row[1:]) for row in cursor.fetchall()}
+
         saved = 0
         for player in players:
             if player is None or isinstance(player, Exception):
@@ -335,13 +357,7 @@ async def add_data_to_database():
                 # fila nueva -> ese avance se pierde para siempre del historial
                 # y jugador del día nunca lo puede contar (80 pts por prestigio,
                 # el valor más alto de la fórmula).
-                cursor.execute("""
-                    SELECT trophies, wins3v3, winsSolo, total_prestige
-                    FROM player_stats_history
-                    WHERE player_tag = %s
-                    ORDER BY timestamp DESC LIMIT 1
-                """, (player.tag,))
-                last = cursor.fetchone()
+                last = last_history_by_tag.get(player.tag)
                 current = (player.trophies, player.team_victories,
                            player.solo_victories + player.duo_victories,
                            player.totalPrestigeLevel)
