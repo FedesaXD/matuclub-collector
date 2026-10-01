@@ -17,8 +17,13 @@ CLUB_TAGS = ['282Y2LR8R', '2Y9GY220C', '2VG0RQ299', '2LLQ8VR2Q']
 # cálculo de tickets y la selección del ganador. Este script solo "toca el
 # timbre" en cada corrida; el endpoint decide si corresponde sortear (es
 # idempotente por mes, así que llamarlo de más no tiene efecto).
-RAFFLE_API_BASE = os.getenv("RAFFLE_API_BASE", "https://matuclub-api.onrender.com")
+RAFFLE_API_BASE = os.getenv("RAFFLE_API_BASE", "https://matuclub-api.onrender.com").rstrip("/")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+# Solo llamamos al endpoint durante los primeros N días del mes (hora UY).
+# Evita despertar el servidor de Render (cold start de ~30-90 s) en las ~48
+# corridas diarias que no tienen nada que sortear, y deja una ventana de
+# reintentos por si el día 1 falla. Poné 31 para llamarlo siempre.
+RAFFLE_TRIGGER_DAYS = int(os.getenv("RAFFLE_TRIGGER_DAYS", "31"))
 
 def get_conn():
     url = os.getenv("DATABASE_URL", "")
@@ -474,37 +479,83 @@ async def fetch_and_store_club_rankings(cursor, client):
 
 
 # ── SORTEOS (Brawl Pass Plus) ─────────────────────────────────
+def _describe_exc(e: Exception) -> str:
+    """str(e) viene VACÍO en los timeouts de httpx; siempre mostramos el tipo."""
+    return f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__} (sin mensaje)"
+
+
 async def trigger_raffle_draw():
     """
-    Le pide a la API que sortee el mes anterior si todavía no lo hizo. Se
-    llama en cada corrida (cada 30 min); el endpoint es idempotente por mes,
-    así que en la inmensa mayoría de las corridas simplemente responde
-    'ya sorteado' y no pasa nada. El día 1 de cada mes, dentro de los
-    primeros 30 minutos, es cuando efectivamente ejecuta el sorteo.
+    Le pide a la API que sortee el mes anterior si todavía no lo hizo. El
+    endpoint es idempotente por mes, así que llamarlo de más no tiene efecto.
+
+    La API corre en Render (free tier), que se duerme tras ~15 min sin tráfico
+    y tarda 30-90 s en despertar. Por eso:
+      1. Primero la "despertamos" con un GET (cualquier respuesta HTTP sirve).
+      2. Luego hacemos el POST con timeouts generosos y reintentos.
     """
     if not ADMIN_KEY:
         print("⚠ ADMIN_KEY no configurada: no se puede disparar el sorteo mensual.")
         return
-    try:
-        async with httpx.AsyncClient(timeout=20) as http:
-            r = await http.post(
-                f"{RAFFLE_API_BASE}/raffle/draw",
-                headers={"X-Admin-Key": ADMIN_KEY},
-            )
-        if r.status_code != 200:
-            print(f"⚠ /raffle/draw devolvió {r.status_code}: {r.text[:200]}")
-            return
-        data = r.json()
-        if data.get("skipped"):
-            print(f"🎟️  Sorteo: {data.get('reason', 'sin novedades')}")
-        else:
-            winner = data.get("winner")
-            if winner:
-                print(f"🎉 Sorteo del mes {data.get('cycle_month')}: ganó {winner['name']} ({winner['tag']}) con {winner['tickets_total']} tickets")
+
+    today_uy = (datetime.now(timezone.utc) - timedelta(hours=3)).date()
+    if today_uy.day > RAFFLE_TRIGGER_DAYS:
+        return  # Fuera de la ventana de sorteo: no molestamos a la API.
+
+    # connect/read/write/pool por separado: el read es el que sufre con el cold start.
+    timeout = httpx.Timeout(connect=30, read=90, write=30, pool=30)
+    max_attempts = 4
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+        # 1) Despertar el servidor. Un 404/405 también significa "ya está despierto".
+        try:
+            await http.get(f"{RAFFLE_API_BASE}/")
+        except Exception as e:
+            print(f"  (warm-up de la API falló: {_describe_exc(e)}; sigo igual)")
+
+        # 2) POST con reintentos.
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = await http.post(
+                    f"{RAFFLE_API_BASE}/raffle/draw",
+                    headers={"X-Admin-Key": ADMIN_KEY},
+                )
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                # Timeout / red / DNS / conexión cortada: vale la pena reintentar.
+                print(f"⚠ Sorteo: intento {attempt}/{max_attempts} falló: {_describe_exc(e)}")
+            except Exception as e:
+                print(f"⚠ No se pudo disparar el sorteo mensual: {_describe_exc(e)}")
+                return
             else:
-                print(f"🎟️  Sorteo del mes {data.get('cycle_month')} ejecutado sin participantes elegibles.")
-    except Exception as e:
-        print(f"⚠ No se pudo disparar el sorteo mensual: {e}")
+                if r.status_code >= 500:
+                    # 502/503/504 son típicos mientras Render termina de arrancar.
+                    print(f"⚠ Sorteo: intento {attempt}/{max_attempts} -> HTTP {r.status_code}: {r.text[:200]}")
+                elif r.status_code != 200:
+                    # 401/403/404/422...: reintentar no arregla nada.
+                    print(f"⚠ /raffle/draw devolvió {r.status_code}: {r.text[:200]}")
+                    return
+                else:
+                    try:
+                        data = r.json()
+                    except ValueError:
+                        print(f"⚠ /raffle/draw devolvió una respuesta no-JSON: {r.text[:200]}")
+                        return
+                    if data.get("skipped"):
+                        print(f"🎟️  Sorteo: {data.get('reason', 'sin novedades')}")
+                    else:
+                        winner = data.get("winner")
+                        if winner:
+                            print(f"🎉 Sorteo del mes {data.get('cycle_month')}: ganó {winner['name']} ({winner['tag']}) con {winner['tickets_total']} tickets")
+                        else:
+                            print(f"🎟️  Sorteo del mes {data.get('cycle_month')} ejecutado sin participantes elegibles.")
+                    return
+
+            if attempt < max_attempts:
+                await asyncio.sleep(10 * attempt)  # 10 s, 20 s, 30 s
+
+    # Se agotaron los intentos. ::warning:: aparece destacado en el resumen de GitHub Actions.
+    print("::warning::No se pudo disparar el sorteo mensual tras varios intentos "
+          "(se reintenta en la próxima corrida)")
 
 
 # ── JUGADOR DEL DÍA ───────────────────────────────────────────
